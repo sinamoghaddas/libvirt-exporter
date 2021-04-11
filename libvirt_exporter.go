@@ -18,14 +18,15 @@ package main
 
 import (
 	"encoding/xml"
-	"github.com/libvirt/libvirt-go"
+	"github.com/AlexZzz/libvirt-exporter/libvirtSchema"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/AlexZzz/libvirt-exporter/libvirtSchema"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"libvirt.org/libvirt-go"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 )
 
 var (
@@ -66,6 +67,35 @@ var (
 			" 3: the domain is paused by user, 4: the domain is being shut down, 5: the domain is shut off,"+
 			"6: the domain is crashed, 7: the domain is suspended by guest power management",
 		[]string{"domain"},
+		nil)
+
+	libvirtDomainVcpuTimeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_vcpu", "time_seconds_total"),
+		"Amount of CPU time used by the domain's VCPU, in seconds.",
+		[]string{"domain", "vcpu"},
+		nil)
+	libvirtDomainVcpuDelayDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_vcpu", "delay_seconds_total"),
+		"Amount of CPU time used by the domain's VCPU, in seconds. "+
+			"Vcpu's delay metric. Time the vcpu thread was enqueued by the "+
+			"host scheduler, but was waiting in the queue instead of running. "+
+			"Exposed to the VM as a steal time.",
+		[]string{"domain", "vcpu"},
+		nil)
+	libvirtDomainVcpuStateDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_vcpu", "state"),
+		"VCPU state. 0: offline, 1: running, 2: blocked",
+		[]string{"domain", "vcpu"},
+		nil)
+	libvirtDomainVcpuCPUDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_vcpu", "cpu"),
+		"Real CPU number, or one of the values from virVcpuHostCpuState",
+		[]string{"domain", "vcpu"},
+		nil)
+	libvirtDomainVcpuWaitDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_vcpu", "wait_seconds_total"),
+		"Vcpu's wait_sum metric. CONFIG_SCHEDSTATS has to be enabled",
+		[]string{"domain", "vcpu"},
 		nil)
 
 	libvirtDomainMetaBlockDesc = prometheus.NewDesc(
@@ -289,13 +319,68 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoCPUTimeDesc,
 		prometheus.CounterValue,
-		float64(info.CpuTime),
+		float64(info.CpuTime)/1000/1000/1000, // From nsec to sec
 		domainName)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoVirDomainState,
 		prometheus.GaugeValue,
 		float64(info.State),
 		domainName)
+
+	domainStatsVcpu, err := stat.Domain.GetVcpus()
+	if err != nil {
+		lverr, ok := err.(libvirt.Error)
+		if !ok || lverr.Code != libvirt.ERR_OPERATION_INVALID {
+			return err
+		}
+	} else {
+		for _, vcpu := range domainStatsVcpu {
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainVcpuStateDesc,
+				prometheus.GaugeValue,
+				float64(vcpu.State),
+				domainName,
+				strconv.FormatInt(int64(vcpu.Number), 10))
+
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainVcpuTimeDesc,
+				prometheus.CounterValue,
+				float64(vcpu.CpuTime)/1000/1000/1000, // From nsec to sec
+				domainName,
+				strconv.FormatInt(int64(vcpu.Number), 10))
+
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainVcpuCPUDesc,
+				prometheus.GaugeValue,
+				float64(vcpu.Cpu),
+				domainName,
+				strconv.FormatInt(int64(vcpu.Number), 10))
+		}
+		/* There's no Wait in GetVcpus()
+		 * But there's no cpu number in libvirt.DomainStats
+		 * Time and State are present in both structs
+		 * So, let's take Wait here
+		 */
+		for cpuNum, vcpu := range stat.Vcpu {
+			if vcpu.WaitSet {
+				ch <- prometheus.MustNewConstMetric(
+					libvirtDomainVcpuWaitDesc,
+					prometheus.CounterValue,
+					float64(vcpu.Wait)/1000/1000/1000,
+					domainName,
+					strconv.FormatInt(int64(cpuNum), 10))
+			}
+			if vcpu.DelaySet {
+				ch <- prometheus.MustNewConstMetric(
+					libvirtDomainVcpuDelayDesc,
+					prometheus.CounterValue,
+					float64(vcpu.Delay)/1e9,
+					domainName,
+					strconv.FormatInt(int64(cpuNum), 10))
+			}
+		}
+	}
+
 	// Report block device statistics.
 	for _, disk := range stat.Block {
 		var DiskSource string
@@ -437,14 +522,16 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 				break
 			}
 		}
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainMetaInterfacesDesc,
-			prometheus.GaugeValue,
-			float64(1),
-			domainName,
-			SourceBridge,
-			iface.Name,
-			VirtualInterface)
+		if SourceBridge != "" || VirtualInterface != "" {
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainMetaInterfacesDesc,
+				prometheus.GaugeValue,
+				float64(1),
+				domainName,
+				SourceBridge,
+				iface.Name,
+				VirtualInterface)
+		}
 		if iface.RxBytesSet {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceRxBytesDesc,
@@ -517,8 +604,8 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	var usedPercent float64
 	if err == nil {
 		MemoryStats = memoryStatCollect(&memorystat)
-		if (MemoryStats.Usable != 0 && MemoryStats.Available != 0) {
-			usedPercent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available)/float64(100))
+		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
+			usedPercent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
 		}
 
 	}
@@ -568,7 +655,6 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		float64(usedPercent),
 		domainName)
 
-
 	return nil
 }
 
@@ -586,14 +672,18 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU,
 		//libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT, // maybe in future
 		libvirt.CONNECT_GET_ALL_DOMAINS_STATS_RUNNING|libvirt.CONNECT_GET_ALL_DOMAINS_STATS_SHUTOFF)
+	defer func(stats []libvirt.DomainStats) {
+		for _, stat := range stats {
+			stat.Domain.Free()
+		}
+	}(stats)
 	if err != nil {
 		return err
 	}
 	for _, stat := range stats {
 		err = CollectDomain(ch, stat)
-		stat.Domain.Free()
 		if err != nil {
-			return err
+			log.Printf("Failed to scrape metrics: %s", err)
 		}
 	}
 	return nil
@@ -648,6 +738,13 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- libvirtDomainInfoNrVirtCPUDesc
 	ch <- libvirtDomainInfoCPUTimeDesc
 	ch <- libvirtDomainInfoVirDomainState
+
+	// VCPU info
+	ch <- libvirtDomainVcpuStateDesc
+	ch <- libvirtDomainVcpuTimeDesc
+	ch <- libvirtDomainVcpuDelayDesc
+	ch <- libvirtDomainVcpuCPUDesc
+	ch <- libvirtDomainVcpuWaitDesc
 
 	// Domain block stats
 	ch <- libvirtDomainMetaBlockDesc
